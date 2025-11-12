@@ -1,0 +1,12 @@
+.git/
+.venv/
+__pycache__/
+*.ipynb
+.env
+*.log
+*.bat
+we-robot-*.json
+node_modules/
+.DS_Store
+Thumbs.db
+
