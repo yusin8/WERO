@@ -51,6 +51,7 @@ async def run_session():
     # Use RawInputStream to get int16 bytes
     with sd.RawInputStream(samplerate=RATE, blocksize=frame_len, dtype='int16', channels=1, callback=callback):
         async with websockets.connect(WS_SERVER, max_size=10_000_000) as ws:
+            t_start = time.perf_counter()
             # wait for voice start
             while True:
                 if not block_q:
@@ -92,6 +93,13 @@ async def run_session():
                 return 2
             print("[pi-stream] STT:", data.get("stt_text"))
             print("[pi-stream] LLM:", data.get("llm_text"))
+            m = data.get("metrics") or {}
+            if m:
+                print(
+                    f"[pi-stream] metrics server: audio={m.get('audio_sec','?')}s, stt={m.get('stt_ms','?')}ms, llm={m.get('llm_ms','?')}ms, tts={m.get('tts_ms','?')}ms, total={m.get('total_ms','?')}ms"
+                )
+            t_end = time.perf_counter()
+            print(f"[pi-stream] metrics client: rtt={int((t_end - t_start)*1000)}ms")
             rate = int(data.get("rate", RATE))
             pcm = base64.b64decode(data.get("pcm_base64", ""))
             arr = np.frombuffer(pcm, dtype=np.int16)
@@ -105,4 +113,3 @@ if __name__ == "__main__":
         asyncio.run(run_session())
     except KeyboardInterrupt:
         sys.exit(0)
-

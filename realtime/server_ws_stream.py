@@ -2,9 +2,11 @@ import os
 import asyncio
 import base64
 import json
-from typing import AsyncIterator, Optional
+import time
+from typing import Optional
 
 import websockets
+from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 import requests
 from google.cloud import speech_v1 as speech
 from google.cloud import texttospeech_v1 as tts
@@ -15,173 +17,138 @@ PORT = int(os.environ.get("WS_PORT", "8766"))  # use a different port than non-s
 FUNCTION_URL = os.environ.get("FUNCTION_URL", "")
 
 
-async def _run_streaming_recognize(
-    cfg: speech.RecognitionConfig,
-    audio_queue: "asyncio.Queue[Optional[bytes]]",
-):
-    client = speech.SpeechClient()
-
-    def req_iter():
-        # first, config
-        s_cfg = speech.StreamingRecognitionConfig(
-            config=cfg,
-            interim_results=True,
-            single_utterance=False,
-        )
-        yield speech.StreamingRecognizeRequest(streaming_config=s_cfg)
-        # then audio chunks until sentinel
-        while True:
-            chunk = asyncio.run_coroutine_threadsafe(audio_queue.get(), asyncio.get_event_loop()).result()
-            if chunk is None:
-                break
-            yield speech.StreamingRecognizeRequest(audio_content=chunk)
-
-    responses = client.streaming_recognize(req_iter())
-    final_text = ""
-    for resp in responses:
-        for res in resp.results:
-            if res.is_final and res.alternatives:
-                final_text = res.alternatives[0].transcript
-    return final_text.strip()
+async def _safe_send(websocket, payload: dict):
+    try:
+        await websocket.send(json.dumps(payload))
+    except (ConnectionClosed, ConnectionClosedOK):
+        return
 
 
-async def handle_connection(websocket: websockets.WebSocketServerProtocol):
-    # Per-utterance state
-    audio_q: Optional[asyncio.Queue] = None
-    recog_task: Optional[asyncio.Task] = None
+async def handle_connection(websocket):
+    # Per-utterance state (VAD로 조기 종료되지만 STT는 배치 인식 사용)
+    buffer: Optional[bytearray] = None
+    rate_hz: int = 16000
+    try:
+        async for message in websocket:
+            data = json.loads(message)
+            mtype = data.get("type")
 
-    async for message in websocket:
-        data = json.loads(message)
-        mtype = data.get("type")
+            if mtype == "begin_utt":
+                rate_hz = int(data.get("rate", 16000))
+                buffer = bytearray()
+                await _safe_send(websocket, {"type": "ack", "ok": True})
 
-        if mtype == "begin_utt":
-            rate = int(data.get("rate", 16000))
-            cfg = speech.RecognitionConfig(
-                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-                language_code="ko-KR",
-                sample_rate_hertz=rate,
-                enable_automatic_punctuation=True,
-            )
-            audio_q = asyncio.Queue()
-            # launch recognizer in background thread via to_thread
-            recog_task = asyncio.create_task(asyncio.to_thread(_blocking_streaming, cfg, audio_q))
-            await websocket.send(json.dumps({"type": "ack", "ok": True}))
+            elif mtype == "audio_chunk":
+                if buffer is None:
+                    await _safe_send(websocket, {"type": "error", "error": "no_active_utterance"})
+                    continue
+                pcm_b64 = data.get("pcm_base64")
+                if not pcm_b64:
+                    continue
+                buffer.extend(base64.b64decode(pcm_b64))
 
-        elif mtype == "audio_chunk":
-            if audio_q is None:
-                await websocket.send(json.dumps({"type": "error", "error": "no_active_utterance"}))
-                continue
-            pcm_b64 = data.get("pcm_base64")
-            if not pcm_b64:
-                continue
-            await audio_q.put(base64.b64decode(pcm_b64))
+            elif mtype == "end_utt":
+                if buffer is None or len(buffer) == 0:
+                    await _safe_send(websocket, {"type": "stt", "text": "", "error": "no_speech"})
+                    continue
+                # 성능 측정을 위해 타이머 시작
+                t0 = time.perf_counter()
+                audio_len_bytes = len(buffer)
+                audio_sec = audio_len_bytes / (2 * max(1, rate_hz))  # int16 mono
+                # 배치 인식으로 즉시 처리
+                try:
+                    stt_client = speech.SpeechClient()
+                    cfg = speech.RecognitionConfig(
+                        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                        language_code="ko-KR",
+                        sample_rate_hertz=rate_hz,
+                        enable_automatic_punctuation=True,
+                    )
+                    audio_in = speech.RecognitionAudio(content=bytes(buffer))
+                    stt_resp = stt_client.recognize(config=cfg, audio=audio_in)
+                    stt_text = stt_resp.results[0].alternatives[0].transcript.strip() if stt_resp.results else ""
+                except Exception as e:
+                    print(f"[server-stream] STT error: {e}")
+                    await _safe_send(websocket, {"type": "error", "error": f"stt_failed: {e}"})
+                    buffer = None
+                    continue
+                t1 = time.perf_counter()
+                stt_ms = int((t1 - t0) * 1000)
+                buffer = None
+                if not stt_text:
+                    await _safe_send(websocket, {"type": "stt", "text": "", "error": "no_speech"})
+                    continue
 
-        elif mtype == "end_utt":
-            if audio_q is None or recog_task is None:
-                await websocket.send(json.dumps({"type": "error", "error": "no_active_utterance"}))
-                continue
-            await audio_q.put(None)
-            # wait STT result
-            stt_text = await recog_task
-            audio_q = None
-            recog_task = None
+                # LLM call
+                if not FUNCTION_URL:
+                    await _safe_send(websocket, {"type": "error", "error": "FUNCTION_URL not set"})
+                    continue
+                try:
+                    r = requests.post(FUNCTION_URL, json={"prompt": stt_text}, timeout=60)
+                    r.raise_for_status()
+                    llm = r.json().get("response", "")
+                except Exception as e:
+                    print(f"[server-stream] LLM call error: {e}")
+                    await _safe_send(websocket, {"type": "error", "error": f"llm_call_failed: {e}"})
+                    continue
+                if not llm:
+                    await _safe_send(websocket, {"type": "error", "error": "empty_llm_response"})
+                    continue
+                t2 = time.perf_counter()
+                llm_ms = int((t2 - t1) * 1000)
 
-            if not stt_text:
-                await websocket.send(json.dumps({"type": "stt", "text": "", "error": "no_speech"}))
-                continue
-
-            # LLM call
-            if not FUNCTION_URL:
-                await websocket.send(json.dumps({"type": "error", "error": "FUNCTION_URL not set"}))
-                continue
-            try:
-                r = requests.post(FUNCTION_URL, json={"prompt": stt_text}, timeout=60)
-                r.raise_for_status()
-                llm = r.json().get("response", "")
-            except Exception as e:
-                await websocket.send(json.dumps({"type": "error", "error": f"llm_call_failed: {e}"}))
-                continue
-            if not llm:
-                await websocket.send(json.dumps({"type": "error", "error": "empty_llm_response"}))
-                continue
-
-            # TTS
-            try:
-                tts_client = tts.TextToSpeechClient()
-                input_text = tts.SynthesisInput(text=llm)
-                voice = tts.VoiceSelectionParams(
-                    language_code="ko-KR", name=os.environ.get("TTS_VOICE", "ko-KR-Standard-A")
+                # TTS
+                try:
+                    tts_client = tts.TextToSpeechClient()
+                    input_text = tts.SynthesisInput(text=llm)
+                    voice = tts.VoiceSelectionParams(
+                        language_code="ko-KR", name=os.environ.get("TTS_VOICE", "ko-KR-Standard-A")
+                    )
+                    sample_rate = int(os.environ.get("TTS_SAMPLE_RATE", "22050"))
+                    speaking_rate = float(os.environ.get("TTS_SPEAKING_RATE", "1.0"))
+                    pitch = float(os.environ.get("TTS_PITCH", "0.0"))
+                    audio_cfg = tts.AudioConfig(
+                        audio_encoding=tts.AudioEncoding.LINEAR16,
+                        sample_rate_hertz=sample_rate,
+                        speaking_rate=speaking_rate,
+                        pitch=pitch,
+                    )
+                    tts_resp = tts_client.synthesize_speech(input=input_text, voice=voice, audio_config=audio_cfg)
+                    pcm_out = tts_resp.audio_content
+                except Exception as e:
+                    print(f"[server-stream] TTS error: {e}")
+                    await _safe_send(websocket, {"type": "error", "error": f"tts_failed: {e}"})
+                    continue
+                t3 = time.perf_counter()
+                tts_ms = int((t3 - t2) * 1000)
+                total_ms = int((t3 - t0) * 1000)
+                print(
+                    f"[perf] audio={audio_sec:.2f}s stt={stt_ms}ms llm={llm_ms}ms tts={tts_ms}ms total={total_ms}ms"
                 )
-                sample_rate = int(os.environ.get("TTS_SAMPLE_RATE", "22050"))
-                speaking_rate = float(os.environ.get("TTS_SPEAKING_RATE", "1.0"))
-                pitch = float(os.environ.get("TTS_PITCH", "0.0"))
-                audio_cfg = tts.AudioConfig(
-                    audio_encoding=tts.AudioEncoding.LINEAR16,
-                    sample_rate_hertz=sample_rate,
-                    speaking_rate=speaking_rate,
-                    pitch=pitch,
-                )
-                tts_resp = tts_client.synthesize_speech(input=input_text, voice=voice, audio_config=audio_cfg)
-                pcm_out = tts_resp.audio_content
-            except Exception as e:
-                await websocket.send(json.dumps({"type": "error", "error": f"tts_failed: {e}"}))
-                continue
 
-            await websocket.send(
-                json.dumps(
+                await _safe_send(
+                    websocket,
                     {
                         "type": "audio_reply",
                         "stt_text": stt_text,
                         "llm_text": llm,
                         "rate": sample_rate,
                         "pcm_base64": base64.b64encode(pcm_out).decode("ascii"),
-                    }
+                        "metrics": {
+                            "audio_sec": round(audio_sec, 2),
+                            "stt_ms": stt_ms,
+                            "llm_ms": llm_ms,
+                            "tts_ms": tts_ms,
+                            "total_ms": total_ms,
+                        },
+                    },
                 )
-            )
 
-        else:
-            await websocket.send(json.dumps({"type": "error", "error": f"unknown_type:{mtype}"}))
-
-
-def _blocking_streaming(cfg: speech.RecognitionConfig, audio_q: "asyncio.Queue[Optional[bytes]]") -> str:
-    # run in a worker thread (called via asyncio.to_thread)
-    client = speech.SpeechClient()
-
-    def req_iter():
-        s_cfg = speech.StreamingRecognitionConfig(
-            config=cfg,
-            interim_results=True,
-            single_utterance=False,
-        )
-        yield speech.StreamingRecognizeRequest(streaming_config=s_cfg)
-        loop = asyncio.new_event_loop()
-        try:
-            while True:
-                # use queue.get_nowait with small sleep
-                try:
-                    item = audio_q.get_nowait()
-                except asyncio.QueueEmpty:
-                    # small sleep to reduce CPU
-                    import time
-
-                    time.sleep(0.01)
-                    continue
-                if item is None:
-                    break
-                yield speech.StreamingRecognizeRequest(audio_content=item)
-        finally:
-            try:
-                loop.close()
-            except Exception:
-                pass
-
-    responses = client.streaming_recognize(req_iter())
-    final_text = ""
-    for resp in responses:
-        for res in resp.results:
-            if res.is_final and res.alternatives:
-                final_text = res.alternatives[0].transcript
-    return final_text.strip()
+            else:
+                await _safe_send(websocket, {"type": "error", "error": f"unknown_type:{mtype}"})
+    except (ConnectionClosed, ConnectionClosedOK):
+        # client closed socket; do not spam stack traces
+        return
 
 
 async def main():
@@ -192,4 +159,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
